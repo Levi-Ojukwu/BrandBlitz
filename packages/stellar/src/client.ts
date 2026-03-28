@@ -1,0 +1,35 @@
+import {
+  Horizon,
+  Keypair,
+  Asset,
+  Networks,
+  TransactionBuilder,
+  BASE_FEE,
+} from "@stellar/stellar-sdk";
+import { rpc as SorobanRpc } from "@stellar/stellar-sdk";
+import { STELLAR_NETWORKS, type NetworkName } from "./constants";
+
+export function getNetwork(name: NetworkName = "testnet") {
+  return STELLAR_NETWORKS[name];
+}
+
+export function getHorizonServer(network: NetworkName = "testnet"): Horizon.Server {
+  const { horizonUrl } = getNetwork(network);
+  return new Horizon.Server(horizonUrl, { allowHttp: network === "testnet" });
+}
+
+export function getRpcServer(network: NetworkName = "testnet"): SorobanRpc.Server {
+  const { rpcUrl } = getNetwork(network);
+  return new SorobanRpc.Server(rpcUrl, { allowHttp: network === "testnet" });
+}
+
+export function getUsdcAsset(network: NetworkName = "testnet"): Asset {
+  const { usdcIssuer } = getNetwork(network);
+  return new Asset("USDC", usdcIssuer);
+}
+
+export function getNetworkPassphrase(network: NetworkName = "testnet"): string {
+  return STELLAR_NETWORKS[network].networkPassphrase;
+}
+
+export { Keypair, Asset, TransactionBuilder, BASE_FEE, Networks };

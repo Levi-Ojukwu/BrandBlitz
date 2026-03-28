@@ -1,0 +1,141 @@
+import { Router } from "express";
+import { z } from "zod";
+import { randomUUID } from "crypto";
+import {
+  createBrand,
+  getBrandsByOwner,
+  getBrandById,
+  updateBrand,
+} from "../db/queries/brands";
+import {
+  createChallenge,
+  insertChallengeQuestions,
+} from "../db/queries/challenges";
+import { generateChallengeQuestions } from "../services/questions";
+import { optimizeImage } from "@brandblitz/storage";
+import { authenticate } from "../middleware/authenticate";
+import { createError } from "../middleware/error";
+
+const router = Router();
+
+const BrandKitSchema = z.object({
+  name: z.string().min(1).max(100),
+  logoKey: z.string().optional(),
+  primaryColor: z.string().regex(/^#[0-9a-fA-F]{6}$/).optional(),
+  secondaryColor: z.string().regex(/^#[0-9a-fA-F]{6}$/).optional(),
+  tagline: z.string().max(100).optional(),
+  brandStory: z.string().max(500).optional(),
+  usp: z.string().max(200).optional(),
+  productImage1Key: z.string().optional(),
+  productImage2Key: z.string().optional(),
+});
+
+const ChallengeSchema = z.object({
+  brandId: z.string().uuid(),
+  poolAmountUsdc: z.string().regex(/^\d+(\.\d{1,7})?$/),
+  maxPlayers: z.number().int().positive().optional(),
+  endsAt: z.string().datetime().optional(),
+});
+
+/**
+ * GET /brands
+ * List brands owned by the authenticated user.
+ */
+router.get("/", authenticate, async (req, res) => {
+  const brands = await getBrandsByOwner(req.user!.sub);
+  res.json({ brands });
+});
+
+/**
+ * GET /brands/:id
+ */
+router.get("/:id", authenticate, async (req, res) => {
+  const brand = await getBrandById(req.params.id);
+  if (!brand) throw createError("Brand not found", 404);
+  if (brand.owner_user_id !== req.user!.sub) throw createError("Forbidden", 403);
+  res.json({ brand });
+});
+
+/**
+ * POST /brands
+ * Create a brand kit. Optimizes uploaded images immediately.
+ */
+router.post("/", authenticate, async (req, res) => {
+  const body = BrandKitSchema.parse(req.body);
+  const userId = req.user!.sub;
+
+  let logoUrl: string | undefined;
+  let productImage1Url: string | undefined;
+  let productImage2Url: string | undefined;
+
+  // Optimize uploaded images server-side (converts to WebP, resizes)
+  if (body.logoKey) {
+    const optimizedKey = await optimizeImage(body.logoKey, "brand-logo");
+    const { getPublicUrl, BUCKETS } = await import("@brandblitz/storage");
+    logoUrl = getPublicUrl(BUCKETS.BRAND_ASSETS, optimizedKey);
+  }
+  if (body.productImage1Key) {
+    const optimizedKey = await optimizeImage(body.productImage1Key, "product-image");
+    const { getPublicUrl, BUCKETS } = await import("@brandblitz/storage");
+    productImage1Url = getPublicUrl(BUCKETS.BRAND_ASSETS, optimizedKey);
+  }
+  if (body.productImage2Key) {
+    const optimizedKey = await optimizeImage(body.productImage2Key, "product-image");
+    const { getPublicUrl, BUCKETS } = await import("@brandblitz/storage");
+    productImage2Url = getPublicUrl(BUCKETS.BRAND_ASSETS, optimizedKey);
+  }
+
+  const brand = await createBrand({
+    owner_user_id: userId,
+    name: body.name,
+    logo_url: logoUrl ?? null,
+    primary_color: body.primaryColor ?? null,
+    secondary_color: body.secondaryColor ?? null,
+    tagline: body.tagline ?? null,
+    brand_story: body.brandStory ?? null,
+    usp: body.usp ?? null,
+    product_image_1_url: productImage1Url ?? null,
+    product_image_2_url: productImage2Url ?? null,
+  });
+
+  res.status(201).json({ brand });
+});
+
+/**
+ * POST /brands/challenges
+ * Create a new challenge and generate questions from brand kit.
+ * Returns the Stellar memo (challenge_id) for the deposit instructions.
+ */
+router.post("/challenges", authenticate, async (req, res) => {
+  const body = ChallengeSchema.parse(req.body);
+
+  const brand = await getBrandById(body.brandId);
+  if (!brand) throw createError("Brand not found", 404);
+  if (brand.owner_user_id !== req.user!.sub) throw createError("Forbidden", 403);
+
+  const challengeId = randomUUID();
+  const challenge = await createChallenge({
+    brandId: body.brandId,
+    challengeId,
+    poolAmountUsdc: body.poolAmountUsdc,
+    maxPlayers: body.maxPlayers,
+    endsAt: body.endsAt,
+  });
+
+  // Auto-generate questions from brand kit (uses other brands as distractors if available)
+  const questions = generateChallengeQuestions(challenge.id, brand, []);
+  await insertChallengeQuestions(questions);
+
+  res.status(201).json({
+    challenge,
+    depositInstructions: {
+      hotWalletAddress: process.env.HOT_WALLET_PUBLIC_KEY,
+      memo: challengeId,
+      amount: body.poolAmountUsdc,
+      asset: "USDC",
+      note: `Send exactly ${body.poolAmountUsdc} USDC to the hot wallet with memo: ${challengeId}`,
+    },
+  });
+});
+
+export default router;

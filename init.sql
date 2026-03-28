@@ -1,0 +1,231 @@
+-- BrandBlitz Database Schema
+-- PostgreSQL 17
+
+CREATE EXTENSION IF NOT EXISTS "pgcrypto";
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- USERS
+-- ─────────────────────────────────────────────────────────────────────────────
+CREATE TABLE users (
+  id                UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  email             TEXT NOT NULL UNIQUE,
+  google_id         TEXT UNIQUE,
+  display_name      TEXT NOT NULL,
+  username          TEXT UNIQUE,
+  avatar_url        TEXT,
+  stellar_address   TEXT,
+  muxed_id          BIGINT UNIQUE,
+  phone_number      TEXT,
+  phone_verified    BOOLEAN NOT NULL DEFAULT FALSE,
+  league            TEXT CHECK (league IN ('bronze', 'silver', 'gold')),
+  total_score       BIGINT NOT NULL DEFAULT 0,
+  total_earned_usdc NUMERIC(20, 7) NOT NULL DEFAULT 0,
+  challenges_played INTEGER NOT NULL DEFAULT 0,
+  role              TEXT NOT NULL DEFAULT 'player' CHECK (role IN ('player', 'brand', 'admin')),
+  created_at        TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  updated_at        TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX idx_users_email        ON users (email);
+CREATE INDEX idx_users_google_id    ON users (google_id);
+CREATE INDEX idx_users_total_score  ON users (total_score DESC);
+CREATE INDEX idx_users_league       ON users (league);
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- BRANDS
+-- ─────────────────────────────────────────────────────────────────────────────
+CREATE TABLE brands (
+  id                  UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  owner_id            UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  name                TEXT NOT NULL,
+  tagline             TEXT,
+  description         TEXT,
+  logo_url            TEXT,
+  logo_key            TEXT,
+  product_image_urls  TEXT[]  NOT NULL DEFAULT '{}',
+  product_image_keys  TEXT[]  NOT NULL DEFAULT '{}',
+  primary_color       TEXT DEFAULT '#6366f1',
+  secondary_color     TEXT DEFAULT '#a5b4fc',
+  website_url         TEXT,
+  created_at          TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  updated_at          TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX idx_brands_owner_id ON brands (owner_id);
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- CHALLENGES
+-- ─────────────────────────────────────────────────────────────────────────────
+CREATE TABLE challenges (
+  id                  UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  brand_id            UUID NOT NULL REFERENCES brands(id) ON DELETE CASCADE,
+  status              TEXT NOT NULL DEFAULT 'pending_deposit'
+                        CHECK (status IN ('pending_deposit', 'active', 'completed', 'cancelled')),
+  pool_amount_usdc    NUMERIC(20, 7) NOT NULL,
+  deposit_address     TEXT NOT NULL,
+  deposit_memo        TEXT NOT NULL UNIQUE,
+  participant_count   INTEGER NOT NULL DEFAULT 0,
+  starts_at           TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  ends_at             TIMESTAMPTZ NOT NULL,
+  payout_tx_hash      TEXT,
+  created_at          TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  updated_at          TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX idx_challenges_brand_id  ON challenges (brand_id);
+CREATE INDEX idx_challenges_status    ON challenges (status);
+CREATE INDEX idx_challenges_ends_at   ON challenges (ends_at);
+CREATE INDEX idx_challenges_memo      ON challenges (deposit_memo);
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- CHALLENGE QUESTIONS (3 per challenge, server-side only)
+-- ─────────────────────────────────────────────────────────────────────────────
+CREATE TABLE challenge_questions (
+  id               UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  challenge_id     UUID NOT NULL REFERENCES challenges(id) ON DELETE CASCADE,
+  round            INTEGER NOT NULL CHECK (round IN (1, 2, 3)),
+  question_text    TEXT NOT NULL,
+  option_a         TEXT NOT NULL,
+  option_b         TEXT NOT NULL,
+  option_c         TEXT NOT NULL,
+  option_d         TEXT NOT NULL,
+  correct_option   CHAR(1) NOT NULL CHECK (correct_option IN ('A', 'B', 'C', 'D')),
+  created_at       TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  UNIQUE (challenge_id, round)
+);
+
+CREATE INDEX idx_challenge_questions_challenge ON challenge_questions (challenge_id);
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- GAME SESSIONS
+-- ─────────────────────────────────────────────────────────────────────────────
+CREATE TABLE game_sessions (
+  id                    UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  user_id               UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  challenge_id          UUID NOT NULL REFERENCES challenges(id) ON DELETE CASCADE,
+  device_id             TEXT,
+  ip_address            INET,
+  status                TEXT NOT NULL DEFAULT 'warmup'
+                          CHECK (status IN ('warmup', 'active', 'completed', 'flagged')),
+  warmup_started_at     TIMESTAMPTZ,
+  warmup_completed_at   TIMESTAMPTZ,
+  challenge_started_at  TIMESTAMPTZ,
+  completed_at          TIMESTAMPTZ,
+  round_1_answer        CHAR(1) CHECK (round_1_answer IN ('A', 'B', 'C', 'D')),
+  round_1_score         INTEGER,
+  round_1_reaction_ms   INTEGER,
+  round_2_answer        CHAR(1) CHECK (round_2_answer IN ('A', 'B', 'C', 'D')),
+  round_2_score         INTEGER,
+  round_2_reaction_ms   INTEGER,
+  round_3_answer        CHAR(1) CHECK (round_3_answer IN ('A', 'B', 'C', 'D')),
+  round_3_score         INTEGER,
+  round_3_reaction_ms   INTEGER,
+  total_score           INTEGER GENERATED ALWAYS AS (
+                          COALESCE(round_1_score, 0) +
+                          COALESCE(round_2_score, 0) +
+                          COALESCE(round_3_score, 0)
+                        ) STORED,
+  rank                  INTEGER,
+  fraud_flags           TEXT[]  NOT NULL DEFAULT '{}',
+  created_at            TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  UNIQUE (user_id, challenge_id)
+);
+
+CREATE INDEX idx_game_sessions_challenge_id ON game_sessions (challenge_id);
+CREATE INDEX idx_game_sessions_user_id      ON game_sessions (user_id);
+CREATE INDEX idx_game_sessions_status       ON game_sessions (status);
+CREATE INDEX idx_game_sessions_total_score  ON game_sessions (challenge_id, total_score DESC NULLS LAST)
+  WHERE status = 'completed';
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- PAYOUTS
+-- ─────────────────────────────────────────────────────────────────────────────
+CREATE TABLE payouts (
+  id               UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  challenge_id     UUID NOT NULL REFERENCES challenges(id) ON DELETE CASCADE,
+  user_id          UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  session_id       UUID NOT NULL REFERENCES game_sessions(id) ON DELETE CASCADE,
+  amount_usdc      NUMERIC(20, 7) NOT NULL,
+  status           TEXT NOT NULL DEFAULT 'pending'
+                     CHECK (status IN ('pending', 'processing', 'completed', 'failed')),
+  tx_hash          TEXT,
+  error_message    TEXT,
+  created_at       TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  updated_at       TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  UNIQUE (challenge_id, user_id)
+);
+
+CREATE INDEX idx_payouts_challenge_id ON payouts (challenge_id);
+CREATE INDEX idx_payouts_user_id      ON payouts (user_id);
+CREATE INDEX idx_payouts_status       ON payouts (status);
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- FRAUD FLAGS
+-- ─────────────────────────────────────────────────────────────────────────────
+CREATE TABLE fraud_flags (
+  id           UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  session_id   UUID NOT NULL REFERENCES game_sessions(id) ON DELETE CASCADE,
+  user_id      UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  flag_type    TEXT NOT NULL,
+  details      JSONB,
+  created_at   TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX idx_fraud_flags_user_id    ON fraud_flags (user_id);
+CREATE INDEX idx_fraud_flags_session_id ON fraud_flags (session_id);
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- LEAGUE ASSIGNMENTS (recalculated weekly)
+-- ─────────────────────────────────────────────────────────────────────────────
+CREATE TABLE league_assignments (
+  id           UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  user_id      UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  league       TEXT NOT NULL CHECK (league IN ('bronze', 'silver', 'gold')),
+  week_start   DATE NOT NULL,
+  score        BIGINT NOT NULL DEFAULT 0,
+  UNIQUE (user_id, week_start)
+);
+
+CREATE INDEX idx_league_assignments_week ON league_assignments (week_start, league, score DESC);
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- USER BADGES
+-- ─────────────────────────────────────────────────────────────────────────────
+CREATE TABLE user_badges (
+  id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  user_id     UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  badge_slug  TEXT NOT NULL,
+  awarded_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  UNIQUE (user_id, badge_slug)
+);
+
+CREATE INDEX idx_user_badges_user_id ON user_badges (user_id);
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- REFERRALS
+-- ─────────────────────────────────────────────────────────────────────────────
+CREATE TABLE referrals (
+  id           UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  referrer_id  UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  referred_id  UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE UNIQUE,
+  rewarded     BOOLEAN NOT NULL DEFAULT FALSE,
+  created_at   TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX idx_referrals_referrer_id ON referrals (referrer_id);
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- UPDATED_AT trigger helper
+-- ─────────────────────────────────────────────────────────────────────────────
+CREATE OR REPLACE FUNCTION set_updated_at()
+RETURNS TRIGGER AS $$
+BEGIN
+  NEW.updated_at = NOW();
+  RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE TRIGGER users_updated_at     BEFORE UPDATE ON users      FOR EACH ROW EXECUTE FUNCTION set_updated_at();
+CREATE TRIGGER brands_updated_at    BEFORE UPDATE ON brands     FOR EACH ROW EXECUTE FUNCTION set_updated_at();
+CREATE TRIGGER challenges_updated_at BEFORE UPDATE ON challenges FOR EACH ROW EXECUTE FUNCTION set_updated_at();
+CREATE TRIGGER payouts_updated_at   BEFORE UPDATE ON payouts    FOR EACH ROW EXECUTE FUNCTION set_updated_at();

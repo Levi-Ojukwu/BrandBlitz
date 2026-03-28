@@ -1,0 +1,50 @@
+# Dev overrides: auto-loaded by `docker compose up`
+# Hot-reload via bind mounts; exposes extra ports for direct service access.
+
+services:
+  postgres:
+    ports:
+      - "5432:5432"
+
+  redis:
+    ports:
+      - "6379:6379"
+
+  minio:
+    ports:
+      - "9000:9000"   # S3 API
+      - "9001:9001"   # MinIO console
+
+  api:
+    build:
+      target: dev
+    command: ["pnpm", "--filter", "@brandblitz/api", "dev"]
+    volumes:
+      - ./apps/api/src:/app/apps/api/src:ro
+      - ./packages:/app/packages:ro
+    ports:
+      - "3001:3001"
+    environment:
+      NODE_ENV: development
+
+  worker:
+    build:
+      target: dev
+    command: ["pnpm", "--filter", "@brandblitz/api", "dev:worker"]
+    volumes:
+      - ./apps/api/src:/app/apps/api/src:ro
+      - ./packages:/app/packages:ro
+    environment:
+      NODE_ENV: development
+
+  web:
+    build:
+      target: dev
+    command: ["pnpm", "--filter", "@brandblitz/web", "dev"]
+    volumes:
+      - ./apps/web/src:/app/apps/web/src:ro
+      - ./apps/web/public:/app/apps/web/public:ro
+    ports:
+      - "3000:3000"
+    environment:
+      NODE_ENV: development
